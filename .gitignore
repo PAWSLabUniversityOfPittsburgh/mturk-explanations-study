@@ -1,4 +1,4 @@
-.streamlit
+.streamlit/secrets.toml
 screener_attempts.json
 survey_data.csv
 tests
