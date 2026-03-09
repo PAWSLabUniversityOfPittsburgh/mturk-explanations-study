@@ -19,7 +19,7 @@ page = st.session_state.page
 if   page == PAGE_SCREENER: page_screener()
 elif page == PAGE_CONSENT:  page_consent()
 elif page == PAGE_SURVEY:   page_survey(df)
-elif page == PAGE_COMPLETE: page_complete()
+elif page == PAGE_COMPLETE: page_complete(df)
 else:
     st.session_state.page = PAGE_SCREENER
     st.rerun()

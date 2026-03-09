@@ -2,14 +2,15 @@ import json
 import random
 import re
 import string
+from datetime import datetime, timezone
 
 import pandas as pd
 import streamlit as st
 
 from config import (
     ATTEMPTS_FILE, COMPLETED_WORKERS_FILE, DATA_FILE,
-    PAGE_SCREENER, QUESTIONS_FILE, RESPONSES_FILE,
-    USE_MTURK_SANDBOX, AWS_REGION,
+    PAGE_SCREENER, QUALIFIED_WORKERS_FILE, QUESTIONS_FILE,
+    RESPONSES_FILE, USE_MTURK_SANDBOX, AWS_REGION,
 )
 
 
@@ -43,10 +44,6 @@ def save_response(payload):
             f.write(json.dumps(payload, ensure_ascii=False) + "\n")
     except Exception as exc:
         st.warning(f"Could not save response: {exc}")
-    # Mark this worker as completed
-    worker_id = payload.get("mturk_worker_id")
-    if worker_id:
-        mark_worker_completed(worker_id)
 
 
 # ---------------------------------------------------------------------------
@@ -80,6 +77,68 @@ def has_worker_completed(worker_id):
     if not worker_id:
         return False
     return worker_id in _load_completed_workers()
+
+
+# ---------------------------------------------------------------------------
+# Qualified workers — skip screener for workers who already passed
+# ---------------------------------------------------------------------------
+
+def _load_qualified_workers():
+    try:
+        with open(QUALIFIED_WORKERS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_qualified_workers(data):
+    try:
+        with open(QUALIFIED_WORKERS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        st.warning(f"Could not persist qualified-workers list: {exc}")
+
+
+def mark_worker_qualified(worker_id, score, completion_code):
+    workers = _load_qualified_workers()
+    if worker_id not in workers:
+        workers[worker_id] = {
+            "score": score,
+            "completion_code": completion_code,
+            "completed_problems": [],
+            "qualified_at": datetime.now(timezone.utc).isoformat(),
+        }
+        _save_qualified_workers(workers)
+
+
+def record_completed_problem(worker_id, problem_idx):
+    """Add a problem index to this worker's completed list."""
+    workers = _load_qualified_workers()
+    rec = workers.get(worker_id)
+    if rec:
+        done = rec.setdefault("completed_problems", [])
+        if problem_idx not in done:
+            done.append(problem_idx)
+            _save_qualified_workers(workers)
+
+
+def get_qualified_worker(worker_id):
+    """Returns the qualification record dict if the worker previously
+    passed the screener, or None otherwise."""
+    if not worker_id:
+        return None
+    return _load_qualified_workers().get(worker_id)
+
+
+def pick_new_problem(df, worker_id):
+    """Pick a random problem index the worker hasn't done yet.
+    Returns the index, or None if all problems are exhausted."""
+    qualified = get_qualified_worker(worker_id)
+    done = qualified.get("completed_problems", []) if qualified else []
+    available = [i for i in range(len(df)) if i not in done]
+    if not available:
+        return None
+    return random.choice(available)
 
 
 # ---------------------------------------------------------------------------
@@ -148,12 +207,6 @@ def verify_worker_id(worker_id):
         return False, (
             f"`{worker_id}` does not look like a valid MTurk Worker ID. "
             "Worker IDs are 10–14 uppercase letters and digits (e.g. A1B2C3D4E5F6G7)."
-        )
-
-    if has_worker_completed(worker_id):
-        return False, (
-            f"**Worker ID `{worker_id}` has already completed this survey.** "
-            "Each worker may only participate once. Please return this HIT on MTurk."
         )
 
     api_ok, api_msg = validate_worker_via_mturk(worker_id)

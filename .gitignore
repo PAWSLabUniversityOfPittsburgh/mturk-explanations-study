@@ -8,3 +8,4 @@ responses.json
 data.csv
 *.bk
 completed_workers.json
+qualified_workers.json

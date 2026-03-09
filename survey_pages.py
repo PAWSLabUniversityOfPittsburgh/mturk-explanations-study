@@ -4,7 +4,12 @@ from datetime import datetime, timezone
 import streamlit as st
 
 from config import MAX_ATTEMPTS, PAGE_CONSENT, PAGE_COMPLETE, PAGE_SURVEY, SPEED_FLAG_SECS,PASS_SCORE
-from utils import get_attempt_count, increment_attempt, render_problem, reshuffle_screener_options, save_response, verify_worker_id
+from utils import (
+    get_attempt_count, get_qualified_worker, increment_attempt,
+    mark_worker_qualified, pick_new_problem, record_completed_problem,
+    render_problem, reshuffle_screener_options,
+    save_response, verify_worker_id,
+)
 
 def _active_questions():
     if st.session_state.get("screener_escalated"):
@@ -15,8 +20,11 @@ def _active_questions():
 def page_screener():
     st.markdown(
         "<h2 style='margin:0 0 0.1rem'>Java Eligibility Check</h2>"
-        "<p style='color:#7c6fa0;font-size:0.85rem;margin:0 0 0.9rem'>"
-        "Answer all 3 questions correctly to qualify.</p>",
+        "<p style='color:#d1c4e9;font-size:0.9rem;margin:0 0 0.9rem'>"
+        "This task requires Java programming proficiency. You are allowed to perform "
+        "the task only if you pass the test, and payment will only be given if you do both: "
+        "passing the eligibility test and performing the task. "
+        "Enter your MTurk ID to start the eligibility test.</p>",
         unsafe_allow_html=True,
     )
 
@@ -39,11 +47,35 @@ def page_screener():
         st.error(wid_error)
         return
 
+    # --- Skip screener for workers who already qualified ---
+    qualified = get_qualified_worker(wid)
+    if qualified:
+        prev_score = qualified["score"]
+        st.session_state.completion_code = qualified["completion_code"]
+        st.success(
+            f"✓ **Welcome back!** You already passed the eligibility check "
+            f"({prev_score}/3). Skipping ahead…"
+        )
+        st.session_state.java_level = f"Passed screener ({prev_score}/3)"
+        st.session_state.demographics.update({
+            "java_screener_score":     prev_score,
+            "java_screener_passed":    True,
+            "java_screener_returning": True,
+        })
+        done_count = len(qualified.get("completed_problems", []))
+        if done_count:
+            st.caption(f"You have completed {done_count} task(s) so far.")
+        col, _ = st.columns([1, 3])
+        with col:
+            if st.button("Continue →"):
+                st.session_state.page = PAGE_CONSENT
+                st.rerun()
+        return
+
     attempt_count = get_attempt_count(wid)
     if attempt_count >= MAX_ATTEMPTS:
         st.error(
-            f"**Worker ID `{wid}` is locked.** All {MAX_ATTEMPTS} allowed attempts used. "
-            "Please return this HIT on MTurk without submitting."
+            "We are sorry you didn't pass the eligibility test. Please close this form."
         )
         return
 
@@ -136,6 +168,7 @@ def page_screener():
     exhausted = used >= MAX_ATTEMPTS
 
     if score == PASS_SCORE:
+        mark_worker_qualified(wid, score, st.session_state.completion_code)
         st.success(f"✓ **Eligibility confirmed** — {score}/3 correct.")
         col, _ = st.columns([1, 3])
         with col:
@@ -153,8 +186,7 @@ def page_screener():
 
     elif exhausted:
         st.error(
-            f"**Maximum attempts reached.** You scored {score}/3. "
-            f"Worker ID `{wid}` is now locked. Please return this HIT without submitting."
+            "We are sorry you didn't pass the eligibility test. Please close this form."
         )
 
     else:
@@ -212,31 +244,15 @@ def page_consent():
         )
     st.session_state.demographics.update({"experience": exp, "role": role})
 
-    st.markdown(
-        "Your responses will only be used for research purposes and the responses will be **ANONYMIZED**.\n\n"
-        "Please read the attached [consent form](https://pitt.co1.qualtrics.com/ControlPanel/File.php?F=F_wa8CERF58sCvIfJ) and provide your consent below:",
-        unsafe_allow_html=False,
-    )
-
-    consent_check = st.radio(
-        "Do you consent to participate?",
-        ["I consent", "I do not consent"],
-        key="consent_check",
-        index=None,
-    )
-    worker_ok = bool(st.session_state.worker_id)
-
-    consented = consent_check == "I consent"
-
-    if consent_check == "I do not consent":
-        st.warning("You must consent to participate. Please return this HIT on MTurk without submitting.")
+    consent_check = st.checkbox("I have read the above and agree to participate.", key="consent_check")
+    worker_ok     = bool(st.session_state.worker_id)
 
     if not worker_ok:
         st.caption("Enter your Worker ID to continue.")
 
     col, _ = st.columns([1, 3])
     with col:
-        if st.button("I Agree & Begin", disabled=not (consented and worker_ok)):
+        if st.button("I Agree & Begin", disabled=not (consent_check and worker_ok)):
             st.session_state.page = PAGE_SURVEY
             st.rerun()
 
@@ -363,6 +379,7 @@ def page_survey(df):
             }
             st.session_state.response_payload = payload
             save_response(payload)
+            record_completed_problem(st.session_state.worker_id, int(st.session_state.problem_idx))
             st.session_state.page = PAGE_COMPLETE
             st.rerun()
 
@@ -370,7 +387,7 @@ def page_survey(df):
         st.caption("Answer all questions before submitting.")
 
 
-def page_complete():
+def page_complete(df):
     code   = st.session_state.completion_code
     worker = st.session_state.worker_id or "Not provided"
 
@@ -401,9 +418,71 @@ def page_complete():
         with st.expander("View recorded response (JSON)"):
             st.json(st.session_state.response_payload)
 
-    col, _, _ = st.columns([1, 2, 1])
-    with col:
-        if st.button("Restart"):
-            for k in list(st.session_state.keys()):
-                del st.session_state[k]
-            st.rerun()
+    # --- Start another task (same completion code, new problem) ---
+    new_idx = pick_new_problem(df, st.session_state.worker_id)
+    if new_idx is not None:
+        st.markdown("---")
+        st.markdown(
+            '<div style="background:#1e1b2e;border-left:3px solid #a78bfa;'
+            'padding:0.6rem 0.9rem;border-radius:0.4rem;margin:0.5rem 0;font-size:0.9rem;color:#d1c4e9">'
+            '🔄 More tasks are available! You can start a new task with the same '
+            'completion code. Your Worker ID and eligibility carry over automatically.'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+        hit_submitted = st.checkbox(
+            "I have submitted my completion code on MTurk for the current HIT.",
+            key="hit_submitted_confirm",
+        )
+        if not hit_submitted:
+            st.caption("Please submit your current HIT on MTurk before starting a new task.")
+        col, _ = st.columns([1, 3])
+        with col:
+            if st.button("Start New Task →", disabled=not hit_submitted):
+                st.session_state.confirm_new_task = True
+
+        if st.session_state.get("confirm_new_task"):
+            st.warning(
+                f"⚠️ **Please confirm:** Did you paste code **{code}** into the MTurk HIT "
+                f"and click **Submit** on the MTurk page? Starting a new task without "
+                f"submitting means you will **not** be paid for the task you just completed."
+            )
+            col_yes, col_no, _ = st.columns([1, 1, 2])
+            with col_yes:
+                if st.button("Yes, I submitted ✓"):
+                    st.session_state.confirm_new_task = False
+                    # Clear task-specific state but keep worker identity & code
+                    keys_to_keep = {
+                        "page", "worker_id", "completion_code", "java_level",
+                        "demographics", "questions_standard", "questions_escalated",
+                    }
+                    for k in list(st.session_state.keys()):
+                        if k not in keys_to_keep:
+                            del st.session_state[k]
+                    # Set up the new task
+                    import random
+                    row = df.iloc[new_idx]
+                    st.session_state.problem_idx = new_idx
+                    st.session_state.task_mode = random.choice(["rate", "pick"])
+                    st.session_state.options_order = None  # force rebuild
+                    options = [
+                        ("correct",      row["explanation"]),
+                        ("distractor_1", row["distractor_1"]),
+                        ("distractor_2", row["distractor_2"]),
+                    ]
+                    random.shuffle(options)
+                    st.session_state.options_order = options
+                    st.session_state.page = PAGE_SURVEY
+                    st.rerun()
+            with col_no:
+                if st.button("No, go back"):
+                    st.session_state.confirm_new_task = False
+                    st.rerun()
+    else:
+        st.markdown(
+            '<div style="background:#1e1b2e;border-left:3px solid #22c55e;'
+            'padding:0.6rem 0.9rem;border-radius:0.4rem;margin:1rem 0;font-size:0.9rem;color:#d1c4e9">'
+            '🎉 You have completed all available tasks. Thank you for your contributions!'
+            '</div>',
+            unsafe_allow_html=True,
+        )

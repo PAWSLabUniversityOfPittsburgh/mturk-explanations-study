@@ -10,6 +10,7 @@ RESPONSES_FILE         = os.path.join(DATA_DIR, "responses.json")
 ATTEMPTS_FILE          = os.path.join(DATA_DIR, "screener_attempts.json")
 QUESTIONS_FILE         = os.path.join(DATA_DIR, "screener_questions.json")
 COMPLETED_WORKERS_FILE = os.path.join(DATA_DIR, "completed_workers.json")
+QUALIFIED_WORKERS_FILE = os.path.join(DATA_DIR, "qualified_workers.json")
 
 MAX_ATTEMPTS    = 2
 PASS_SCORE      = 3
